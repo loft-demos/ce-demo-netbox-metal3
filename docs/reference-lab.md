@@ -151,7 +151,7 @@ Two labels in this lab are named in a way that will mislead you:
 - `demo.vcluster.com/bmh-host=true` is on `vmetal`, and `vmetal` **is** the
   Metal3 host.
 - `demo.vcluster.com/vmetal-host=true` is on `vmetal-w02`, and `vmetal-w02` is
-  **not** the Metal3 host. It is the NiCo host. See
+  **not** the Metal3 host. It is the NICo host. See
   [nico-and-other-providers.md](nico-and-other-providers.md).
 
 `env.example` calls the first one `BMH_HOST_LABEL` for that reason: what matters
