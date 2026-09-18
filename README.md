@@ -194,7 +194,7 @@ namespace, is in [docs/runbook.md](docs/runbook.md).
 
 ## What was verified, and what was not
 
-Read directly out of `loft-enterprise/pkg/netbox` and the NetBox 4.7 source, so
+Read directly out of vCluster Platform source code and the NetBox 4.7 source, so
 these are facts about the implementation rather than observations: the
 token-scheme behaviour, the boot-MAC selection rule, the five missing-requirement
 checks, the host-conflict and orphan rules, the label set, and the
