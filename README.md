@@ -9,7 +9,7 @@ NetBox as the inventory source for a Metal3 NodeProvider.
 
 ## What it does
 
-Tag a device in NetBox. On the next sync the platform creates a `Machine`. That
+Tag a device in NetBox. On the next sync (the NetBox syncer runs every minute) the platform creates a `Machine`. That
 happens first and it happens regardless: the Machine is the import made
 visible, and it exists whether or not NetBox knows enough to boot the thing.
 
