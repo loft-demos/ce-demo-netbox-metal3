@@ -76,15 +76,3 @@ Two practical notes from doing this in the reference lab:
   where they can reach the BMC network and attach the host-local provisioning
   network attachment. Nothing about a NICo provider wants a share of that, which
   is the main reason the split stays clean.
-
----
-
-## Worth raising with engineering
-
-If a mixed lab is going to be a customer-facing story, "NetBox as the common
-inventory across Metal3 and NICo providers" is a reasonable ask, and the platform
-is already shaped for it: `MachineSourceLabel`, the `SourceAttached` /
-`Registered` conditions, and the orphan-protection rules are all provider
-agnostic. What is missing is a projection from a NetBox device to whatever a NICo
-provider would need to register a machine, which only makes sense if NICo has a
-registration API at all.
