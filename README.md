@@ -50,16 +50,21 @@ that is running a tenant node and watch the platform refuse.
 ## Who this is for
 
 Anyone standing up the NetBox import: on real hardware with real BMCs, or on an
-emulated fleet (sushy-tools + libvirt) if you do not have a rack handy.
+emulated fleet if you do not have a rack handy.
 
 Two lanes run through the docs, marked where they differ:
 
-| | Real BMCs | Emulated fleet |
+| | Real BMCs | Emulated fleet (sushy-tools + libvirt) |
 | --- | --- | --- |
 | Seeding NetBox | however you already do it, or adapt `hack/seed-netbox.py` | `hack/seed-netbox.py` reads the libvirt inventory |
 | BMC addressing | already unique per machine | `hack/bmc-ip-aliases.sh` gives each one its own IP |
 | `addressTemplate` | vendor-specific, often the platform default works | must render the Redfish system id (see below) |
 | Everything else | identical | identical |
+
+Emulating with **kubevirtbmc** instead of sushy-tools works too, and drops two
+of the three traps below. It has one of its own, because a virtbmc Service is
+addressed by DNS name and the import requires an IP. See
+[docs/kubevirtbmc.md](docs/kubevirtbmc.md) before you seed anything.
 
 The platform side is the same either way, and so is everything in
 [docs/netbox-data-model.md](docs/netbox-data-model.md) and
@@ -102,9 +107,11 @@ worked example of what those values look like filled in, is in
 2. **Check whether the BMC address template has a usable default.** The
    platform default is `redfish://{{ .Address }}/redfish/v1/Systems/1`, which is
    right for a lot of real BMCs and wrong for anything that keys systems by an
-   id. sushy-tools keys them by libvirt domain UUID, so an emulated fleet needs
-   the UUID stored as the NetBox device **serial** and rendered:
+   id. sushy-tools keys them by libvirt domain UUID, so that lane needs the UUID
+   stored as the NetBox device **serial** and rendered:
    `redfish+http://{{ .Address }}:8000/redfish/v1/Systems/{{ .Serial }}`.
+   kubevirtbmc does not have this problem and has a different one
+   ([docs/kubevirtbmc.md](docs/kubevirtbmc.md)).
 
 3. **Existing BareMetalHosts block the import.** A host the import did not
    create is not its to write to, so a host you made by hand under the name a
@@ -122,6 +129,7 @@ docs/
   runbook.md                install -> seed -> wire -> verify -> demo -> roll back
   netbox-data-model.md      what the platform reads, and the five things a device must have
   troubleshooting.md        every condition and event the sync can raise, and the fix
+  kubevirtbmc.md            running it against kubevirtbmc instead of sushy-tools
   nico-and-other-providers.md  why the import is Metal3-only today
   reference-lab.md          the concrete environment this was built and verified on
 manifests/

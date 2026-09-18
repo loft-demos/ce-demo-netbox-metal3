@@ -216,6 +216,10 @@ Set `insecure=true` if NetBox serves a self-signed certificate.
 **Skip this step entirely if your BMCs are real.** Real BMCs already have their
 own addresses, which is the whole point of them.
 
+**Skip it for kubevirtbmc too.** It gives every machine its own BMC Service, so
+there is nothing to alias. See [kubevirtbmc.md](kubevirtbmc.md), which also
+covers the problem you get instead.
+
 NetBox's `ENFORCE_GLOBAL_UNIQUE` is on by default, so ten devices cannot all
 record the same out-of-band IP. sushy-tools listens on `0.0.0.0:8000`, so the
 fix is to put several addresses on the provisioning bridge. Each one answers
@@ -334,8 +338,13 @@ adoption path: the import reads what a DCIM already holds.
 
 ### If you are seeding an emulated fleet
 
-`hack/seed-netbox.py` builds the whole record from a libvirt inventory. It is
-stdlib-only, so it runs on the hypervisor host with no `pip install`.
+`hack/seed-netbox.py` builds the whole record from a **libvirt** inventory. It
+is stdlib-only, so it runs on the hypervisor host with no `pip install`.
+
+It is specific to that lane. A KubeVirt fleet is already declared in a chart or
+a set of CRs, so generate the NetBox record from the same values that generate
+the VMs rather than reaching for this script; the import does not depend on it
+either way.
 
 ```bash
 python3 hack/seed-netbox.py --inventory "$VM_INVENTORY" --dry-run
@@ -471,10 +480,15 @@ worked.
 addressTemplate: "redfish+http://{{ .Address }}:8000/redfish/v1/Systems/{{ .Serial }}"
 ```
 
-That is the **emulated** form. sushy-tools keys systems by libvirt domain UUID,
+That is the **sushy-tools** form. sushy keys systems by libvirt domain UUID,
 and the UUID is in the device serial, so the default
 (`redfish://{{ .Address }}/redfish/v1/Systems/1`) would dial the same
 non-existent system for every host.
+
+It is not the form for every emulator. kubevirtbmc always serves
+`/redfish/v1/Systems/1`, terminates TLS, and is reached by Service name rather
+than by IP, so its template is a different shape again:
+[kubevirtbmc.md](kubevirtbmc.md).
 
 For real BMCs, the default is often right, because many vendors do serve
 `/redfish/v1/Systems/1`. Check one by hand before you assume:
