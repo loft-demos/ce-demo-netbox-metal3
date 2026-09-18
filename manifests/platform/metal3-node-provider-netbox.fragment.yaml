@@ -1,0 +1,216 @@
+# ############################################################################
+# FRAGMENT - DO NOT `kubectl apply` THIS FILE.
+#
+# These are the two blocks to merge into a Metal3 NodeProvider you ALREADY HAVE
+# and that already provisions machines. Applying a whole NodeProvider from this
+# repo would drop your `spec.metal3.deploy` block and your existing pools, which
+# is not what anyone wants.
+#
+# If the provider is under GitOps, merge these into the repo copy and push. Do
+# not `kubectl apply` or `kubectl patch` a provider a reconciler owns: with
+# selfHeal on you get reverted roughly a minute after you convince yourself it
+# worked.
+#
+# manifests/platform/metal3-node-provider-netbox.example.yaml is a complete
+# worked provider if you would rather diff whole objects than merge blocks.
+# ############################################################################
+
+# ---------------------------------------------------------------------------
+# BLOCK 1 - add under spec.metal3, as a sibling of clusterRef / deploy / nodeTypes
+# ---------------------------------------------------------------------------
+netBox:
+  # The connector Secret, in the Platform namespace on the PLATFORM cluster --
+  # not the cluster the BareMetalHosts land in.
+  secretRef:
+    namespace: vcluster-platform
+    name: netbox
+
+  # Devices carrying this NetBox tag are imported; nothing else is visible to
+  # the platform. Default is "vcluster-sync"; spelled out here so the tag in
+  # NetBox and the provider that reads it cannot drift apart.
+  #
+  # Removing the tag from a device releases it -- but never deprovisions a
+  # machine that is in use; that one is kept and flagged Orphaned instead.
+  tag: vcluster-sync
+
+  # HOW THE BMC IS ADDRESSED. This is the line most likely to need changing for
+  # your hardware, and the platform's default is only right for some of it.
+  #
+  #   default:  redfish://{{ .Address }}/redfish/v1/Systems/1
+  #
+  # Many real BMCs do serve /redfish/v1/Systems/1, so the default works. Check
+  # one by hand before assuming:
+  #   curl -sk -u user:pass https://<a-real-bmc>/redfish/v1/Systems
+  #
+  # The value below is the EMULATED form, for a sushy-tools fleet: sushy keys
+  # each emulated server by its libvirt domain UUID, which hack/seed-netbox.py
+  # writes into the NetBox device's serial. Without it every host would dial the
+  # same non-existent system.
+  #
+  # Fields: {{ .Address }} the management IP (oob_ip, or an address on a
+  #                        mgmt_only interface), IPv6 bracketed
+  #         {{ .IP }} {{ .Device }} {{ .Manufacturer }} {{ .DeviceType }}
+  #         {{ .Serial }}
+  # Anything else fails at render with missingkey=error, and the template is
+  # parsed when the provider is written, so a typo is caught where you made it.
+  addressTemplate: "redfish+http://{{ .Address }}:8000/redfish/v1/Systems/{{ .Serial }}"
+
+  # Where the BMC login lives on the NetBox device. These are the defaults;
+  # stated explicitly so the custom fields NetBox has and the provider that
+  # reads them cannot drift apart. Point them at fields your NetBox already
+  # protects if it has any -- see manifests/metal3/shared-bmc-creds-secret.yaml
+  # for the alternatives.
+  customFields:
+    bmcUsername: bmc_username
+    bmcPassword: bmc_password
+
+  # Laid over every BareMetalHost the import creates. The template wins field by
+  # field, so anything here overrides what NetBox describes.
+  #
+  # Labels and annotations here are kept current on existing hosts; the SPEC is
+  # applied at create time only. And it is one value for every host: there is no
+  # per-device templating, which is why a per-host annotation your old generator
+  # wrote has no direct equivalent (see manifests/metal3/lan-mac-annotator-cronjob.yaml).
+  bareMetalHostTemplate:
+    metadata:
+      labels:
+        # A label that says "this fleet", for selectors and for bulk deletes.
+        # Every OTHER selector label below is derived from the device record by
+        # the import; this is the one dimension NetBox has no field for.
+        demo: netbox-import
+    spec:
+      # Exercise the full Metal3 clean/deprovision lifecycle.
+      automatedCleaningMode: metadata
+      # KVM/QEMU virtio disk. On real hardware this is your actual boot device:
+      # /dev/sda, /dev/nvme0n1, or a hint by model/serial/WWN.
+      rootDeviceHints:
+        deviceName: /dev/vda
+      bmc:
+        # Emulated BMCs serve plain HTTP; real ones commonly serve a self-signed
+        # certificate. Either way this is usually what you want in a lab and
+        # usually not what you want in production.
+        disableCertificateVerification: true
+      # NOTE: deliberately NOT setting `online: true`. The import creates hosts
+      # with online: false, which is what vMetal's claim path needs -- a host
+      # sitting in `available` with the power on is not a claimable candidate.
+      # If your old generator set online: true, do not carry that over.
+      #
+      # Two other template values change the RULES rather than just the output:
+      #
+      #   bmc:
+      #     credentialsName: redfish-shared-creds   # makes the BMC login custom
+      #                                             # fields optional, and stops
+      #                                             # per-host Secrets entirely
+      #   bootMACAddress: "aa:bb:cc:dd:ee:ff"       # makes the NetBox boot MAC
+      #                                             # optional (single-host only,
+      #                                             # since it is one value for
+      #                                             # every host)
+      #
+      # The template may NOT set the keys the import owns
+      # (machines.vcluster.com/source, machines.vcluster.com/netbox-device, or
+      # anything under netbox.vcluster.com/). The provider is rejected at write
+      # time if it tries.
+
+# ---------------------------------------------------------------------------
+# BLOCK 2 - rewrite spec.metal3.nodeTypes[*].bareMetalHosts.selector
+#
+# The import stamps NetBox facts onto every Machine and BareMetalHost it
+# creates, so the pools select on the DCIM record instead of on labels whatever
+# you used before wrote by hand. The labels available to select on:
+#
+#   netbox.vcluster.com/site           site slug
+#   netbox.vcluster.com/location       location slug
+#   netbox.vcluster.com/rack           rack NAME (not the slug)
+#   netbox.vcluster.com/role           device role slug
+#   netbox.vcluster.com/device-type    device type slug
+#   netbox.vcluster.com/manufacturer   manufacturer slug
+#   netbox.vcluster.com/status         device status
+#   machines.vcluster.com/source       always `netbox` on imported hosts
+#
+# Map whatever you select on today onto those. A typical before/after:
+#
+#   topology.vcluster.com/az           -> netbox.vcluster.com/site
+#   topology.vcluster.com/row          -> netbox.vcluster.com/location
+#   topology.vcluster.com/rack         -> netbox.vcluster.com/rack
+#   inventory.vcluster.com/size        -> netbox.vcluster.com/device-type
+#   inventory.vcluster.com/accelerator -> netbox.vcluster.com/role
+#
+# Collapsing the accelerator dimension into the NetBox device role is worth
+# doing on purpose: a DCIM already answers "what is this box for", and one label
+# is easier to keep true than two.
+#
+# `machines.vcluster.com/source: netbox` in every selector lets hand-rolled
+# BareMetalHosts and imported ones coexist while you migrate.
+#
+# Do NOT select on netbox.vcluster.com/availability or /provisionable: both
+# change as machines are claimed, and a pool would empty out under load.
+#
+# Two pools shown. Add yours the same way; the shape does not change.
+# ---------------------------------------------------------------------------
+nodeTypes:
+  - name: rack-a-small-pool
+    resources:
+      cpu: "2"
+      memory: 4Gi
+    bareMetalHosts:
+      selector:
+        matchLabels:
+          demo: netbox-import
+          machines.vcluster.com/source: netbox
+          netbox.vcluster.com/site: <site-slug>
+          netbox.vcluster.com/location: <location-slug>
+          netbox.vcluster.com/rack: rack-a
+          netbox.vcluster.com/device-type: demo-small
+          netbox.vcluster.com/role: cpu-compute
+    properties:
+      vcluster.com/customer: customer-a
+      vcluster.com/az: <site-slug>
+      vcluster.com/row: <location-slug>
+      vcluster.com/rack: rack-a
+      vcluster.com/profile: small
+      vcluster.com/accelerator: cpu-only
+      vcluster.com/cpu: "2"
+      vcluster.com/memory: 4Gi
+
+  - name: rack-a-large-pool
+    resources:
+      cpu: "4"
+      memory: 8Gi
+    bareMetalHosts:
+      selector:
+        matchLabels:
+          demo: netbox-import
+          machines.vcluster.com/source: netbox
+          netbox.vcluster.com/site: <site-slug>
+          netbox.vcluster.com/location: <location-slug>
+          netbox.vcluster.com/rack: rack-a
+          netbox.vcluster.com/device-type: demo-large
+          netbox.vcluster.com/role: cpu-compute
+    properties:
+      vcluster.com/customer: customer-a
+      vcluster.com/az: <site-slug>
+      vcluster.com/row: <location-slug>
+      vcluster.com/rack: rack-a
+      vcluster.com/profile: large
+      vcluster.com/accelerator: cpu-only
+      vcluster.com/cpu: "4"
+      vcluster.com/memory: 8Gi
+
+  # ---------------------------------------------------------------------------
+  # A GPU pool, if you have one.
+  #
+  # Select on the ROLE alone, on top of the demo/source/site/location keys:
+  #
+  #     netbox.vcluster.com/role: gpu-compute
+  #
+  # and leave the device-type key out, so the pool keeps working whatever size
+  # class the GPU machines happen to be. Set its properties to the real
+  # accelerator (vcluster.com/accelerator: <model-slug>), and size any NodeType
+  # that consumes it for the number of machines that actually hold a card: a
+  # replica beyond that will never schedule, and the failure reads as a
+  # scheduling problem rather than an inventory one.
+  #
+  # On an emulated fleet this is usually ONE machine, because the host owns one
+  # physical card. hack/seed-netbox.py will not give a GPU to a whole size class
+  # for exactly that reason.
+  # ---------------------------------------------------------------------------

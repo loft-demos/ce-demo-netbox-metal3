@@ -1,0 +1,139 @@
+# ############################################################################
+# OPTIONAL. Stamp `lan.vcluster.com/mac` onto NetBox-imported BareMetalHosts.
+#
+# YOU MAY NOT NEED THIS. It is here because it is the one gap between "the
+# import created the host" and "the machine actually joined the tenant cluster"
+# that is not obvious from any condition, and because the shape of the problem
+# generalizes past this one annotation.
+#
+# WHEN YOU NEED IT
+# A MachineConfigTemplate that renders networkData from a PER-HOST annotation,
+# e.g.:
+#
+#   "ethernet_mac_address": "{{ index .Values.BareMetalHost
+#                              "metadata" "annotations" "lan.vcluster.com/mac" }}"
+#
+# A generator script can write a different annotation per host. The NetBox
+# import cannot: the only place to set annotations on imported hosts is
+# `spec.metal3.netBox.bareMetalHostTemplate.metadata`, which applies ONE value
+# to every host, and `addressTemplate` is the only templated field (it renders
+# bmc.address, and its context carries no interface data).
+#
+# Rendered empty, cloud-init cannot match the link to a NIC, the interface never
+# comes up, and the machine provisions successfully and then sits at NodeClaim
+# `Pending / NotJoined` forever, because it has no path to the tenant cluster.
+# Nothing reports this as a failure. Observed 2026-09-17; see
+# docs/troubleshooting.md.
+#
+# HOW IT WORKS
+# Every host already knows its own answer after inspection: `status.hardware.nics`
+# lists every interface and flags the PXE one. The non-PXE one is the LAN NIC.
+# This job copies its MAC into the annotation, which is mechanical, idempotent,
+# and self-healing across re-imports.
+#
+# A host with more than two NICs needs a better rule than "the one that is not
+# PXE" -- the `awk` below takes the first non-PXE NIC in whatever order the
+# status reports, which is fine for two and arbitrary for three.
+#
+# RETIRE THIS when the platform derives `lan.vcluster.com/mac` at import time
+# the way it already derives netbox.vcluster.com/rack and friends. The import
+# parses the device's interfaces anyway, to pick the PXE MAC for
+# spec.bootMACAddress.
+#
+# NOTE: the annotation is read when networkData is RENDERED, at provision time.
+# A host that is already provisioned will not pick up a late annotation; release
+# its NodeClaim so it re-provisions.
+#
+#   kubectl --context "$METAL3_CONTEXT" -n "$METAL3_NS" \
+#     apply -f manifests/metal3/lan-mac-annotator-cronjob.yaml
+#
+# Check two things for your cluster: the kubectl image tag, and the namespace
+# (hardcoded to metal3-system below, in four places plus the NS env var).
+# ############################################################################
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lan-mac-annotator
+  namespace: metal3-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lan-mac-annotator
+  namespace: metal3-system
+rules:
+  - apiGroups: ["metal3.io"]
+    resources: ["baremetalhosts"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lan-mac-annotator
+  namespace: metal3-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lan-mac-annotator
+subjects:
+  - kind: ServiceAccount
+    name: lan-mac-annotator
+    namespace: metal3-system
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lan-mac-annotator
+  namespace: metal3-system
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          serviceAccountName: lan-mac-annotator
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+          containers:
+            - name: annotate
+              image: registry.k8s.io/kubectl:v1.31.0
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+                limits: {cpu: 200m, memory: 128Mi}
+              env:
+                - name: NS
+                  value: metal3-system
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+
+                  # name + MAC for every non-PXE NIC. Hosts that have not been
+                  # inspected yet have no .status.hardware and are skipped.
+                  kubectl -n "$NS" get baremetalhosts.metal3.io -o go-template='
+                  {{- range .items -}}
+                    {{- $n := .metadata.name -}}
+                    {{- with .status.hardware -}}
+                      {{- range .nics -}}
+                        {{- if not .pxe -}}{{ $n }} {{ .mac }}{{ "\n" }}{{- end -}}
+                      {{- end -}}
+                    {{- end -}}
+                  {{- end -}}' \
+                  | awk 'NF==2 && !seen[$1]++ { print $1, $2 }' \
+                  | while read -r name mac; do
+                      cur=$(kubectl -n "$NS" get baremetalhosts.metal3.io "$name" \
+                            -o jsonpath='{.metadata.annotations.lan\.vcluster\.com/mac}' 2>/dev/null || true)
+                      if [ "$cur" = "$mac" ]; then
+                        echo "= $name already $mac"
+                      else
+                        kubectl -n "$NS" annotate baremetalhosts.metal3.io "$name" \
+                          --overwrite "lan.vcluster.com/mac=$mac"
+                        echo "+ $name -> $mac${cur:+ (was $cur)}"
+                      fi
+                    done

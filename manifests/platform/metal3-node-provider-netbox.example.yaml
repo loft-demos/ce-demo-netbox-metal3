@@ -1,0 +1,393 @@
+# ############################################################################
+# A COMPLETE WORKED NodeProvider - an EXAMPLE, not something to apply.
+#
+# manifests/platform/metal3-node-provider-netbox.fragment.yaml has the two
+# blocks to merge into a provider you already have. This file is the same thing
+# assembled into a whole object, for people who would rather diff two complete
+# NodeProviders than merge blocks by hand.
+#
+# It is the reference lab's provider (docs/reference-lab.md) with the names
+# genericized. The values that are still concrete -- chart versions, image tags,
+# the provisioning subnet, the GPU model -- are kept deliberately: a worked
+# example with placeholders in every field is not a worked example.
+#
+# CHECK THESE BEFORE COPYING ANYTHING:
+#   - spec.metal3.deploy is the part that breaks clusters. The metal3 chart runs
+#     Helm WITH schema validation, so a bad value fails closed and takes every
+#     other change in the same apply down with it. Keep YOUR deploy block.
+#   - demo.vcluster.com/bmh-host is this lab's label for "the node that owns the
+#     provisioning bridge". Yours will be called something else.
+#   - the addressTemplate below is the EMULATED sushy-tools form. See the
+#     fragment for when the platform default is right instead.
+#   - 172.22.0.0/24 is this lab's provisioning subnet.
+#
+# Two things in here are worth reading even if you copy none of it: the metal3
+# 0.6.0 note (it cost two days) and the h100 DECISION note (what happens when a
+# selector dimension your old lane invented has no NetBox equivalent).
+# ############################################################################
+apiVersion: management.loft.sh/v1
+kind: NodeProvider
+metadata:
+  name: metal3-dc1
+spec:
+  displayName: Metal3 Provider (dc1)
+  properties:
+    metal3.vcluster.com/dns-servers: 1.1.1.1,8.8.8.8
+    # NOTE: a host address, not the network (172.22.0.0/24). Left as-is because
+    # it demonstrably works; change only if you are touching this line anyway.
+    metal3.vcluster.com/network-cidr: 172.22.0.1/24
+    metal3.vcluster.com/network-ip-range: 172.22.0.23-172.22.0.250
+    # This lab's MachineConfigTemplate. It renders networkData from a
+    # per-host `lan.vcluster.com/mac` annotation, which the import cannot set
+    # -- see manifests/metal3/lan-mac-annotator-cronjob.yaml for the workaround
+    # and why. Check whether yours has the same dependency before cutting over.
+    vcluster.com/network-data-template-config: vmetal-lan-only-postboot
+    vcluster.com/os-image: ubuntu-noble-bootstrap
+    vcluster.com/ssh-keys: admin-bastion-host
+
+  metal3:
+    clusterRef:
+      cluster: metal3-cluster
+      namespace: metal3-system
+
+    deploy:
+      # multus: no helmValues. Chart 0.1.0 has no nodeSelector or namespace
+      # support, so anything here is a no-op. It therefore runs on all nodes,
+      # and since multus becomes each node's primary CNI, every node it lands
+      # on gains a CNI dependency. Only the dhcp-proxy pod on the provisioning host actually uses
+      # a secondary network. Restricting it needs a chart change upstream.
+      multus:
+        enabled: true
+
+      dhcp:
+        enabled: true
+        # Pinned. Unpinned, the platform moved metal3 from 0.4.1 to 0.6.0 on
+        # 2026-09-15 with nothing in this file asking for it, and broke the
+        # provisioning path for two days (see the metal3 note below). Pin both
+        # halves so the pair only ever moves deliberately.
+        version: "0.17.0"
+        helmValues: |
+          # No proxy.ironicApiUrl override. The chart default is correct against
+          # metal3 0.6.1; it was only wrong against 0.6.0.
+          nodeSelector:
+            demo.vcluster.com/bmh-host: "true"
+          networkAttachmentDefinition:
+            vip: 172.22.0.2/24
+            config: |
+              {
+                "cniVersion": "0.3.1",
+                "type": "bridge",
+                "bridge": "br-provision",
+                "ipam": {}
+              }
+
+      metal3:
+        enabled: true
+        # 0.6.0 put `SSLVerifyClient require` on the Ironic API vhost, which the
+        # dhcp-proxy cannot satisfy (its binary has no client-certificate flag).
+        # Every IPA lookup and heartbeat through the callback proxy failed with
+        # `remote error: tls: certificate required`, breaking provisioning AND
+        # deprovisioning. 0.6.1 fixes it. Do not sit on 0.6.0.
+        version: "0.6.1"
+        helmValues: |
+          nodeSelector:
+            demo.vcluster.com/bmh-host: "true"
+          ironic:
+            image:
+              tag: release-32.0
+            extraEnv:
+              - name: IRONIC_FAST_TRACK
+                value: "false"
+              - name: IRONIC_AUTOMATED_CLEAN
+                value: "true"
+
+    # ------------------------------------------------------------------------
+    # NetBox becomes the inventory. The platform only ever READS NetBox.
+    # ------------------------------------------------------------------------
+    netBox:
+      secretRef:
+        namespace: vcluster-platform
+        name: netbox
+      tag: vcluster-sync
+      # sushy-tools keys each emulated server by its libvirt domain UUID, which
+      # hack/seed-netbox.py writes into the NetBox device serial. The platform
+      # default ends in /Systems/1 and would dial one non-existent system for
+      # every host.
+      addressTemplate: "redfish+http://{{ .Address }}:8000/redfish/v1/Systems/{{ .Serial }}"
+      customFields:
+        bmcUsername: bmc_username
+        bmcPassword: bmc_password
+      bareMetalHostTemplate:
+        metadata:
+          labels:
+            # The one dimension NetBox has no field for. Every other selector
+            # label below is derived from the device record by the import.
+            demo: netbox-import
+        spec:
+          automatedCleaningMode: metadata
+          rootDeviceHints:
+            deviceName: /dev/vda
+          bmc:
+            disableCertificateVerification: true
+          # Deliberately NOT online: true. The import creates hosts with
+          # online: false, which is what the claim path needs.
+
+    # ------------------------------------------------------------------------
+    # Pools. Label mapping from the hand-rolled lane:
+    #   topology.vcluster.com/az           -> netbox.vcluster.com/site
+    #   topology.vcluster.com/row          -> netbox.vcluster.com/location
+    #   topology.vcluster.com/rack         -> netbox.vcluster.com/rack
+    #   inventory.vcluster.com/size        -> netbox.vcluster.com/device-type
+    #   inventory.vcluster.com/accelerator -> netbox.vcluster.com/role
+    #
+    # Never select on netbox.vcluster.com/availability or /provisionable: both
+    # change as machines are claimed, and a pool would empty out under load.
+    #
+    # Machines per pool, against the 10-device inventory seeded 2026-09-17:
+    #   rack-a-small 2 | rack-a-medium 1 | rack-a-large 1 | rack-a-xlarge 1
+    #   rack-b-small 2 | rack-b-medium 0 | rack-b-large 1 | rack-b-xlarge 1
+    #   rack-c-xlarge-gpu 1
+    # ------------------------------------------------------------------------
+    nodeTypes:
+      # ---- rack-c -----------------------------------------------------------
+      # The only pool that may select gpu-compute, and its capacity is exactly
+      # one machine (the single RTX 2000 Ada passed through to that domain).
+      # Size any NodeType consuming it for one machine; a second replica will
+      # never schedule. No device-type key, so it keeps working whether the
+      # inventory calls that profile `xlarge` or `xlarge-gpu`.
+      - name: rack-c-xlarge-gpu-pool
+        metadata: {}
+        resources:
+          cpu: "8"
+          memory: 24Gi
+          nvidia.com/gpu: "1"
+        bareMetalHosts:
+          selector:
+            matchLabels:
+              demo: netbox-import
+              machines.vcluster.com/source: netbox
+              netbox.vcluster.com/site: dc1
+              netbox.vcluster.com/location: row-1
+              netbox.vcluster.com/rack: rack-c
+              netbox.vcluster.com/role: gpu-compute
+        properties:
+          vcluster.com/accelerator: rtx-2000-ada
+          vcluster.com/az: dc1
+          vcluster.com/cpu: "8"
+          vcluster.com/memory: 24Gi
+          vcluster.com/profile: xlarge-gpu
+          vcluster.com/rack: rack-c
+          vcluster.com/row: row-1
+
+      # ---- rack-a -----------------------------------------------------------
+      - name: rack-a-small-pool
+        metadata: {}
+        resources:
+          cpu: "2"
+          memory: 4Gi
+        bareMetalHosts:
+          selector:
+            matchLabels:
+              demo: netbox-import
+              machines.vcluster.com/source: netbox
+              netbox.vcluster.com/site: dc1
+              netbox.vcluster.com/location: row-1
+              netbox.vcluster.com/rack: rack-a
+              netbox.vcluster.com/device-type: demo-small
+              netbox.vcluster.com/role: cpu-compute
+        properties:
+          vcluster.com/accelerator: cpu-only
+          vcluster.com/az: dc1
+          vcluster.com/cpu: "2"
+          vcluster.com/memory: 4Gi
+          vcluster.com/profile: small
+          vcluster.com/rack: rack-a
+          vcluster.com/row: row-1
+
+      - name: rack-a-medium-pool
+        metadata: {}
+        resources:
+          cpu: "3"
+          memory: 6Gi
+        bareMetalHosts:
+          selector:
+            matchLabels:
+              demo: netbox-import
+              machines.vcluster.com/source: netbox
+              netbox.vcluster.com/site: dc1
+              netbox.vcluster.com/location: row-1
+              netbox.vcluster.com/rack: rack-a
+              netbox.vcluster.com/device-type: demo-medium
+              netbox.vcluster.com/role: cpu-compute
+        properties:
+          vcluster.com/accelerator: cpu-only
+          vcluster.com/az: dc1
+          vcluster.com/cpu: "3"
+          vcluster.com/memory: 6Gi
+          vcluster.com/profile: medium
+          vcluster.com/rack: rack-a
+          vcluster.com/row: row-1
+
+      # DECISION - h100: a worked example of the thing that always comes up on
+      # a cutover -- a selector dimension the OLD lane invented and NetBox has
+      # no field for.
+      #
+      # The pre-NetBox object declared vcluster.com/accelerator: h100 here and
+      # selected inventory.vcluster.com/accelerator: h100, a label the generator
+      # script wrote as demo fiction (two `large` machines carried it, on a host
+      # with no H100). seed-netbox.py emits only two roles,
+      # cpu-compute and gpu-compute, so after the cutover an h100 selector
+      # matches nothing. Resolved to cpu-only below.
+      # To KEEP that story instead: add a third device role in NetBox (e.g.
+      # `h100-compute`), assign it to those devices, select
+      # netbox.vcluster.com/role: h100-compute here, and set
+      # vcluster.com/accelerator: h100. Which is the general answer: a dimension
+      # worth selecting on is a dimension worth recording in the DCIM.
+      - name: rack-a-large-pool
+        metadata: {}
+        resources:
+          cpu: "4"
+          memory: 8Gi
+        bareMetalHosts:
+          selector:
+            matchLabels:
+              demo: netbox-import
+              machines.vcluster.com/source: netbox
+              netbox.vcluster.com/site: dc1
+              netbox.vcluster.com/location: row-1
+              netbox.vcluster.com/rack: rack-a
+              netbox.vcluster.com/device-type: demo-large
+              netbox.vcluster.com/role: cpu-compute
+        properties:
+          vcluster.com/accelerator: cpu-only
+          vcluster.com/az: dc1
+          vcluster.com/cpu: "4"
+          vcluster.com/memory: 8Gi
+          vcluster.com/profile: large
+          vcluster.com/rack: rack-a
+          vcluster.com/row: row-1
+
+      - name: rack-a-xlarge-pool
+        metadata: {}
+        resources:
+          cpu: "8"
+          memory: 16Gi
+        bareMetalHosts:
+          selector:
+            matchLabels:
+              demo: netbox-import
+              machines.vcluster.com/source: netbox
+              netbox.vcluster.com/site: dc1
+              netbox.vcluster.com/location: row-1
+              netbox.vcluster.com/rack: rack-a
+              netbox.vcluster.com/device-type: demo-xlarge
+              netbox.vcluster.com/role: cpu-compute
+        properties:
+          vcluster.com/accelerator: cpu-only
+          vcluster.com/az: dc1
+          vcluster.com/cpu: "8"
+          vcluster.com/memory: 16Gi
+          vcluster.com/profile: xlarge
+          vcluster.com/rack: rack-a
+          vcluster.com/row: row-1
+
+      # ---- rack-b -----------------------------------------------------------
+      - name: rack-b-small-pool
+        metadata: {}
+        resources:
+          cpu: "2"
+          memory: 4Gi
+        bareMetalHosts:
+          selector:
+            matchLabels:
+              demo: netbox-import
+              machines.vcluster.com/source: netbox
+              netbox.vcluster.com/site: dc1
+              netbox.vcluster.com/location: row-1
+              netbox.vcluster.com/rack: rack-b
+              netbox.vcluster.com/device-type: demo-small
+              netbox.vcluster.com/role: cpu-compute
+        properties:
+          vcluster.com/accelerator: cpu-only
+          vcluster.com/az: dc1
+          vcluster.com/cpu: "2"
+          vcluster.com/memory: 4Gi
+          vcluster.com/profile: small
+          vcluster.com/rack: rack-b
+          vcluster.com/row: row-1
+
+      # NOTE: zero machines. rack-b in the current inventory is small, small,
+      # large, xlarge. Kept so the pool list stays symmetric with rack-a; drop
+      # it if an always-empty pool in the UI is worse than the asymmetry.
+      - name: rack-b-medium-pool
+        metadata: {}
+        resources:
+          cpu: "3"
+          memory: 6Gi
+        bareMetalHosts:
+          selector:
+            matchLabels:
+              demo: netbox-import
+              machines.vcluster.com/source: netbox
+              netbox.vcluster.com/site: dc1
+              netbox.vcluster.com/location: row-1
+              netbox.vcluster.com/rack: rack-b
+              netbox.vcluster.com/device-type: demo-medium
+              netbox.vcluster.com/role: cpu-compute
+        properties:
+          vcluster.com/accelerator: cpu-only
+          vcluster.com/az: dc1
+          vcluster.com/cpu: "3"
+          vcluster.com/memory: 6Gi
+          vcluster.com/profile: medium
+          vcluster.com/rack: rack-b
+          vcluster.com/row: row-1
+
+      # DECISION - h100: see the rack-a-large-pool note.
+      - name: rack-b-large-pool
+        metadata: {}
+        resources:
+          cpu: "4"
+          memory: 8Gi
+        bareMetalHosts:
+          selector:
+            matchLabels:
+              demo: netbox-import
+              machines.vcluster.com/source: netbox
+              netbox.vcluster.com/site: dc1
+              netbox.vcluster.com/location: row-1
+              netbox.vcluster.com/rack: rack-b
+              netbox.vcluster.com/device-type: demo-large
+              netbox.vcluster.com/role: cpu-compute
+        properties:
+          vcluster.com/accelerator: cpu-only
+          vcluster.com/az: dc1
+          vcluster.com/cpu: "4"
+          vcluster.com/memory: 8Gi
+          vcluster.com/profile: large
+          vcluster.com/rack: rack-b
+          vcluster.com/row: row-1
+
+      - name: rack-b-xlarge-pool
+        metadata: {}
+        resources:
+          cpu: "8"
+          memory: 16Gi
+        bareMetalHosts:
+          selector:
+            matchLabels:
+              demo: netbox-import
+              machines.vcluster.com/source: netbox
+              netbox.vcluster.com/site: dc1
+              netbox.vcluster.com/location: row-1
+              netbox.vcluster.com/rack: rack-b
+              netbox.vcluster.com/device-type: demo-xlarge
+              netbox.vcluster.com/role: cpu-compute
+        properties:
+          vcluster.com/accelerator: cpu-only
+          vcluster.com/az: dc1
+          vcluster.com/cpu: "8"
+          vcluster.com/memory: 16Gi
+          vcluster.com/profile: xlarge
+          vcluster.com/rack: rack-b
+          vcluster.com/row: row-1

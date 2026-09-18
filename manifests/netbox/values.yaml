@@ -1,0 +1,158 @@
+# NetBox Helm values for the demo.
+#
+# Chart:  oci://ghcr.io/netbox-community/netbox-chart/netbox
+#         (or repo https://charts.netbox.oss.netboxlabs.com/)
+# Pinned: 8.3.77  -> NetBox v4.7.0   (verified render 2026-09-16)
+#
+# EDIT BEFORE USE. Every <angle-bracket> value below is yours. They match the
+# variable names in env.example, so either edit them by hand once, or fill them
+# from a sourced env.sh:
+#
+#   sed -e "s|<netbox-hostname>|$NETBOX_HOSTNAME|g" \
+#       -e "s|<admin-email>|$NETBOX_ADMIN_EMAIL|g" \
+#       -e "s|<storage-class>|$STORAGE_CLASS|g" \
+#       -e "s|<bmh-host-label>|$BMH_HOST_LABEL|g" \
+#       -e "s|<gateway-name>|$GATEWAY_NAME|g" \
+#       -e "s|<gateway-namespace>|$GATEWAY_NAMESPACE|g" \
+#       -e "s|<gateway-listener>|$GATEWAY_SECTION|g" \
+#       manifests/netbox/values.yaml > /tmp/netbox-values.yaml
+#
+# Install:
+#   helm upgrade --install netbox oci://ghcr.io/netbox-community/netbox-chart/netbox \
+#     --version 8.3.77 -n "$NETBOX_NAMESPACE" --create-namespace \
+#     -f /tmp/netbox-values.yaml \
+#     --set superuser.password="$NETBOX_ADMIN_PASSWORD"
+#
+# NetBox does not have to live on the Platform cluster, or on the Metal3
+# cluster. It has to be reachable FROM the Platform's pods, because that is
+# where the sync runs. See docs/runbook.md step 1.
+
+## --- identity -------------------------------------------------------------
+
+superuser:
+  name: admin
+  email: <admin-email>
+  # Pass with --set superuser.password=... ; do not commit it.
+  password: ""
+  # Leave apiToken EMPTY. On NetBox 4.7 the container only creates a token when
+  # BOTH superuser_api_token and superuser_api_key are mounted, and the chart
+  # mounts only the first -- so this value silently does nothing. The token the
+  # platform uses is created by hand in the UI (see docs/runbook.md step 2).
+  apiToken: ""
+
+allowedHosts:
+  - <netbox-hostname>
+  - "*"
+
+# TLS terminates at the gateway, so Django sees plain HTTP and would reject the
+# login POST without this. Drop it only if NetBox terminates TLS itself.
+csrf:
+  trustedOrigins:
+    - https://<netbox-hostname>
+
+# Keep IPAM honest: one BMC address per device. Set to false ONLY if you take
+# the shared-BMC-IP shortcut in docs/runbook.md step 3.
+enforceGlobalUnique: true
+
+## --- placement & size -----------------------------------------------------
+
+# OPTIONAL. NetBox has no host-local dependency the way Ironic and the DHCP
+# proxy do, so pinning it is a choice about where you want the data to live,
+# not a requirement. Delete every nodeSelector block below if you do not care.
+#
+# If you DO pin it, pin the workload and its PVs together. A node-affine
+# local-path volume plus a nodeSelector that disagrees with it is a Pending pod
+# with an unhelpful message, and it will cost you an afternoon.
+nodeSelector: &placement
+  <bmh-host-label>: "true"
+
+# Explicit `resources` rather than `resourcesPreset: small`. The preset caps
+# memory at 768Mi, and first boot is the hungriest moment NetBox has: the full
+# v4.7 migration set runs while gunicorn has already forked its workers, and
+# each worker carries its own copy of the app (roughly 150-250Mi RSS). Setting
+# `resources` also silences the chart's "resources section not set" warning,
+# because the Bitnami helper prefers it over the preset.
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+persistence:
+  enabled: true
+  size: 2Gi
+  storageClass: <storage-class>
+
+## --- edge -----------------------------------------------------------------
+# Gateway API. Check three things on your Gateway before installing:
+#   1. a listener named <gateway-listener> exists
+#   2. its hostname covers <netbox-hostname>
+#   3. it accepts routes from the namespace you install NetBox into
+#      (allowedRoutes.namespaces.from: All needs nothing further; Same or a
+#       selector needs a ReferenceGrant or a different namespace)
+#
+#   kubectl -n "$GATEWAY_NAMESPACE" get gateway "$GATEWAY_NAME" \
+#     -o jsonpath='{range .spec.listeners[*]}{.name}{"\t"}{.hostname}{"\t"}{.allowedRoutes.namespaces.from}{"\n"}{end}'
+#
+# Using classic Ingress instead? Drop this block and set ingress.enabled: true.
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: <gateway-name>
+      namespace: <gateway-namespace>
+      sectionName: <gateway-listener>
+  hostnames:
+    - <netbox-hostname>
+
+## --- background jobs ------------------------------------------------------
+
+worker:
+  replicaCount: 1
+  # Same reasoning as the main app, scaled down: one RQ process, but
+  # hack/seed-netbox.py queues enough work to keep it busy for a while.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  nodeSelector: *placement
+
+housekeeping:
+  enabled: true
+  resourcesPreset: small
+  nodeSelector: *placement
+
+## --- bundled datastores ---------------------------------------------------
+# Both are Bitnami subcharts. Since the August 2025 Docker Hub change they pull
+# `bitnami/postgresql:latest` and `bitnami/valkey:latest` -- unpinned by design.
+# If that bites, set postgresql.image.* / valkey.image.* to a mirror you control.
+#
+# Point these at an external Postgres instead if you have one; the chart takes
+# postgresql.enabled: false plus externalDatabase.*.
+
+postgresql:
+  enabled: true
+  auth:
+    database: netbox
+    username: netbox
+  primary:
+    resourcesPreset: small
+    nodeSelector: *placement
+    persistence:
+      size: 8Gi
+      storageClass: <storage-class>
+
+valkey:
+  enabled: true
+  # Chart default is `replication` -> 1 primary + 3 replicas. A demo needs one.
+  architecture: standalone
+  primary:
+    resourcesPreset: nano
+    nodeSelector: *placement
+    persistence:
+      size: 2Gi
+      storageClass: <storage-class>
