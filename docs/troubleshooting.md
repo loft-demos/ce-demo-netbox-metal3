@@ -284,8 +284,8 @@ copied `online: true` into the `bareMetalHostTemplate`, take it out.
 ## Machines provision, then sit at `NotJoined` forever
 
 The host installs fine and never appears in the tenant cluster. Check whether
-your MachineConfigTemplate renders `networkData` from an annotation the import
-does not set:
+your MachineConfigTemplate still renders `networkData` from an annotation the
+import does not set:
 
 ```bash
 kubectl --context "$METAL3_CONTEXT" -n "$METAL3_NS" get bmh <name> \
@@ -304,14 +304,36 @@ to every host, and `addressTemplate` is the only templated field. So a generator
 script that wrote a per-host annotation has no direct equivalent here.
 
 Rendered empty, cloud-init cannot match the link to a NIC, the interface never
-comes up, and the machine provisions successfully and then has no path to the
-tenant cluster. `manifests/metal3/lan-mac-annotator-cronjob.yaml` works around it
-by reading each host's own `status.hardware.nics` after inspection and stamping
-the non-PXE MAC back on. Observed 2026-09-17.
+comes up, and the machine provisions successfully with no path to the tenant
+cluster. The current reference lab avoids the annotation entirely: the
+network-data template reads `.Values.BareMetalHost.status.hardware.nics` and
+uses the first NIC whose `pxe` field is not true. That works because networkData
+is rendered after inspection, when the BareMetalHost status has the NIC list.
 
-The annotation is read when `networkData` is **rendered**, at provision time, so
-a host that is already provisioned will not pick up a late annotation. Release
-its NodeClaim so it re-provisions.
+A host with more than two data NICs needs a better rule than "first non-PXE
+NIC"; record enough intent in your template inputs or DCIM model before using
+that shape in production.
+
+NetworkData is rendered at provision time, so a host that is already provisioned
+will not pick up a template fix. Release its NodeClaim so it re-provisions.
+
+---
+
+## Hosts sit `inspecting` with empty hardware
+
+Check whether the DHCP proxy is dropping the PXE request because the imported
+BareMetalHost has no inspection DHCP address:
+
+```bash
+kubectl --context "$METAL3_CONTEXT" -n "$METAL3_NS" get bmh <name> \
+  -o jsonpath='{.metadata.annotations.metal3\.vcluster\.com/ip-address}{"\n"}'
+```
+
+If it is empty, apply or check
+`manifests/metal3/provisioning-ip-annotator-cronjob.yaml`. The platform writes
+`metal3.vcluster.com/ip-address` when a Machine claims the host, but inspection
+happens earlier, so imported BareMetalHosts need a registration-time value until
+the platform owns that lifecycle stage.
 
 ---
 

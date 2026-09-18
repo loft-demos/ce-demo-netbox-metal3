@@ -69,8 +69,9 @@ netBox:
   #
   # Labels and annotations here are kept current on existing hosts; the SPEC is
   # applied at create time only. And it is one value for every host: there is no
-  # per-device templating, which is why a per-host annotation your old generator
-  # wrote has no direct equivalent (see manifests/metal3/lan-mac-annotator-cronjob.yaml).
+  # per-device templating, so values that used to differ per generated host must
+  # either come from NetBox-derived labels, inspected BareMetalHost status, or a
+  # separate controller/annotator.
   bareMetalHostTemplate:
     metadata:
       labels:

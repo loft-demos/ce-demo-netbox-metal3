@@ -135,12 +135,14 @@ docs/
 manifests/
   netbox/values.yaml                            Helm values, chart 8.3.77 / NetBox v4.7.0
   platform/netbox-connector-secret.yaml         the connector Secret shape
+  platform/vmetal-lan-only-postboot-machineconfigtemplate.yaml
+                                                optional: networkData from inspected non-PXE NIC
   platform/metal3-node-provider-netbox.fragment.yaml
                                                 the two blocks to merge into your NodeProvider
   platform/metal3-node-provider-netbox.example.yaml
                                                 a complete worked NodeProvider, for diffing
   metal3/shared-bmc-creds-secret.yaml           optional: no BMC passwords in NetBox
-  metal3/lan-mac-annotator-cronjob.yaml         optional: stamp the non-PXE MAC onto imported hosts
+  metal3/provisioning-ip-annotator-cronjob.yaml optional: patch imported BMHs with an inspection DHCP address
 hack/
   seed-netbox.py            build a NetBox record from a libvirt inventory (idempotent)
   bmc-ip-aliases.sh         give each emulated BMC its own address on the provisioning bridge
@@ -180,15 +182,48 @@ kubectl --context "$PLATFORM_CONTEXT" -n "$PLATFORM_NAMESPACE" \
 kubectl --context "$PLATFORM_CONTEXT" -n "$PLATFORM_NAMESPACE" \
   label secret netbox loft.sh/connector-type=netbox
 
-# 5. Merge manifests/platform/metal3-node-provider-netbox.fragment.yaml into
+# 5. Optional Platform-side template for the reference lab's two-NIC shape.
+#    Skip this if your existing networkData already targets the right NIC.
+kubectl --context "$PLATFORM_CONTEXT" \
+  apply -f manifests/platform/vmetal-lan-only-postboot-machineconfigtemplate.yaml
+
+# 6. Merge manifests/platform/metal3-node-provider-netbox.fragment.yaml into
 #    your NodeProvider and apply it the way you normally apply it
 
-# 6. Verify
+# 7. Metal3 cluster: bridge the current import gap until the platform allocates
+#    inspection DHCP addresses when it registers BareMetalHosts.
+kubectl --context "$METAL3_CONTEXT" -n "$METAL3_NS" \
+  apply -f manifests/metal3/provisioning-ip-annotator-cronjob.yaml
+
+# 8. Verify
 bash hack/verify-netbox-import.sh
 ```
 
 Full detail, including what to do about hosts that already exist in the Metal3
 namespace, is in [docs/runbook.md](docs/runbook.md).
+
+---
+
+## Do you need `vmetal-lan-only-postboot`?
+
+Only if your claim-time `networkData` needs to target a different NIC than the
+PXE/provisioning NIC, and you do not already have a template that does that.
+The reference sushy-tools lab has two NICs: `eth0`/PXE on the provisioning
+network, and `eth1` on the tenant/LAN network. The platform's default bare-metal
+networkData uses `spec.bootMACAddress`, which is the PXE NIC, so this repo
+includes `vmetal-lan-only-postboot` to choose the first inspected non-PXE NIC
+instead.
+
+You probably do **not** need it if your machines have one NIC and that one
+network can carry PXE/inspection, Ironic callbacks, the installed node IP, and
+the tenant cluster join path. You also do not need it if your existing
+`MachineConfigTemplate` already names the correct interface or MAC source. Keep
+that template and do not copy the `vcluster.com/network-data-template-config`
+property from the worked example.
+
+This is separate from the provisioning IP annotator. Imported hosts still need
+`metal3.vcluster.com/ip-address` before first inspection until the platform
+allocates that address at BareMetalHost registration time.
 
 ---
 
@@ -202,10 +237,11 @@ checks, the host-conflict and orphan rules, the label set, and the
 
 Verified by running it: the Helm values render clean against chart 8.3.77; the
 seeding script is idempotent; the import creates Machines, BareMetalHosts and
-BMC Secrets from tagged devices and releases them on untag; the
-`lan.vcluster.com/mac` gap that
-[manifests/metal3/lan-mac-annotator-cronjob.yaml](manifests/metal3/lan-mac-annotator-cronjob.yaml)
-works around is real and was hit in the reference lab.
+BMC Secrets from tagged devices and releases them on untag; imported hosts need
+`metal3.vcluster.com/ip-address` before first inspection, so
+[manifests/metal3/provisioning-ip-annotator-cronjob.yaml](manifests/metal3/provisioning-ip-annotator-cronjob.yaml)
+patches that current platform timing gap; the lab network-data template now
+derives the LAN MAC from the host's inspected non-PXE NIC.
 
 Not verified anywhere here: any real BMC. Everything in this repo was exercised
 against sushy-tools. The platform code path is the same, but vendor Redfish

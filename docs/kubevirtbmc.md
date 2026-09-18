@@ -186,8 +186,8 @@ Match whichever your VM definitions expect rather than copying either blindly.
 **`rootDeviceHints` is one value for every host.** This is the real limitation.
 KubeVirt's guest device name follows the disk bus, so a fleet mixing virtio and
 scsi/sata/usb disks needs two different hints, and `bareMetalHostTemplate.spec`
-applies a single value to all of them. Same shape as the
-`lan.vcluster.com/mac` gap: the template is not per-device.
+applies a single value to all of them. Same shape as any per-host value a
+generator used to stamp: the template is not per-device.
 
 Your options are a uniform disk bus across the tagged fleet, or one
 NodeProvider per bus with a different tag for each. The first is easier and is

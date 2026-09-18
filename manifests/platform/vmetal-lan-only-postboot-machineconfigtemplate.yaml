@@ -1,0 +1,48 @@
+apiVersion: management.loft.sh/v1
+kind: MachineConfigTemplate
+metadata:
+  name: vmetal-lan-only-postboot
+spec:
+  displayName: vMetal LAN from inspected NICs
+  networkDataTemplate: |-
+    {{- $lanMAC := "" -}}
+    {{- range .Values.BareMetalHost.status.hardware.nics -}}
+    {{- if and (not $lanMAC) (not .pxe) .mac -}}
+    {{- $lanMAC = .mac -}}
+    {{- end -}}
+    {{- end -}}
+    {
+      "links": [
+        {
+          "id": "tenant0",
+          "type": "phy",
+          "ethernet_mac_address": "{{ $lanMAC }}"
+        }
+      ],
+      "networks": [
+        {
+          "id": "tenant0-ipv4",
+          "type": "ipv4",
+          "link": "tenant0",
+          "ip_address": "{{ .Values.AllocatedIP }}",
+          "netmask": "{{ .Values.Netmask }}",
+          "routes": [
+            {
+              "network": "0.0.0.0",
+              "netmask": "0.0.0.0",
+              "gateway": "{{ .Values.Gateway }}"
+            }
+          ]
+        }
+      ],
+      "services": [
+        {
+          "type": "dns",
+          "address": "1.1.1.1"
+        },
+        {
+          "type": "dns",
+          "address": "8.8.8.8"
+        }
+      ]
+    }

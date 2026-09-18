@@ -459,6 +459,28 @@ blocks to merge into your existing provider.
 `manifests/platform/metal3-node-provider-netbox.example.yaml` is a complete
 worked provider if you would rather diff against a whole object.
 
+Create the networkData template the worked provider points at if you are using
+the reference lab's two-NIC shape:
+
+```bash
+kubectl --context "$PLATFORM_CONTEXT" \
+  apply -f manifests/platform/vmetal-lan-only-postboot-machineconfigtemplate.yaml
+```
+
+That `MachineConfigTemplate` is intentionally **not** a NetBox import object.
+It lives on the Platform cluster and is selected by the provider property
+`vcluster.com/network-data-template-config: vmetal-lan-only-postboot`. It
+renders networkData at provision time from the inspected BareMetalHost NIC list,
+choosing the first NIC whose `pxe` field is not true for the tenant/LAN link.
+
+Skip this template if your existing networkData already targets the NIC the
+installed node should use. A single-NIC lab often does not need it at all: the
+default bare-metal networkData uses `spec.bootMACAddress`, which is fine when
+the same NIC and network carry PXE/inspection, the installed node address, and
+the tenant cluster join path. In that case, do not copy
+`vcluster.com/network-data-template-config: vmetal-lan-only-postboot` from the
+worked example.
+
 1. **`spec.metal3.netBox`**: the connector reference, the tag, the address
    template, the custom field names, and the BareMetalHost template.
 2. **`spec.metal3.nodeTypes[*].bareMetalHosts.selector`**: rewritten to select
@@ -509,6 +531,22 @@ kubectl --context "$PLATFORM_CONTEXT" get nodeprovider "$NODE_PROVIDER" \
   -o jsonpath='{.spec.metal3.netBox}' | python3 -m json.tool
 ```
 
+### The provisioning IP annotator
+
+Apply this to the Metal3 cluster while using the NetBox import:
+
+```bash
+kubectl --context "$METAL3_CONTEXT" -n "$METAL3_NS" \
+  apply -f manifests/metal3/provisioning-ip-annotator-cronjob.yaml
+```
+
+The vMetal DHCP proxy needs `metal3.vcluster.com/ip-address` before the first
+inspection boot. The platform already writes that annotation, but only when a
+Machine claims the host, which is too late for newly imported BareMetalHosts.
+The cronjob gives unclaimed hosts a short-lived address from the reference lab's
+reserved pool; when a host is claimed, the platform overwrites it with the normal
+claim-time IPAM address.
+
 ---
 
 ## 8. Watch the import land
@@ -538,6 +576,9 @@ kubectl --context "$METAL3_CONTEXT" -n "$METAL3_NS" get bmh \
 
 Expected order of events:
 
+The MachineConfigTemplate is a prerequisite for claim-time networkData, not an
+import event. The NetBox sync does not create or update it.
+
 1. A `Machine` appears per tagged device, `Pending` / `NotRegistered`, with the
    hardware NetBox knows about already filled in. This is always first, and it
    happens whether or not the record is complete.
@@ -545,9 +586,11 @@ Expected order of events:
    appear on the Metal3 cluster, in that order, and the Machine goes
    `Registered=True`. No Secret is written if the provider's
    `bareMetalHostTemplate` pins `bmc.credentialsName`.
-3. Metal3 registers and inspects the host: `registering -> inspecting ->
+3. The provisioning IP annotator patches imported BareMetalHosts that do not yet
+   carry `metal3.vcluster.com/ip-address`.
+4. Metal3 registers and inspects the host: `registering -> inspecting ->
    available`, powered off.
-4. A tenant cluster using one of the pools claims a host as before.
+5. A tenant cluster using one of the pools claims a host as before.
 
 If a Machine stays `Pending` with reason `MissingRequirements`, NetBox is missing
 something the provisioner needs; the condition message names it. That is the

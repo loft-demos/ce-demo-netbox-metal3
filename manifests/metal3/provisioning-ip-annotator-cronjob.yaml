@@ -1,0 +1,150 @@
+# ############################################################################
+# Stamp `metal3.vcluster.com/ip-address` onto NetBox-imported BareMetalHosts.
+#
+# This replaces the older two-purpose workaround. `lan.vcluster.com/mac` is gone:
+# the MachineConfigTemplate now derives the LAN MAC from the host's own
+# inspection status.
+#
+# WHY THIS EXISTS
+# The dhcp-proxy builds each DHCP offer from this annotation. Without it the
+# request is dropped with "missing metal3.vcluster.com/ip-address annotation",
+# the machine never PXE boots, and the host sits in `inspecting` with errorCount
+# climbing and an EMPTY errorMessage until Ironic's inspect-wait timeout fires
+# roughly two hours later and parks the node in `inspect failed`.
+#
+# The platform DOES own this value: it allocates from the NodeProvider's
+# network-ip-range (172.22.0.23-250) and writes the annotation itself. It just
+# does it when a machine is CLAIMED, which is several lifecycle stages after
+# inspection needs an address. This job fills that window with a short-lived
+# address from a small pool below the platform's range; the platform overwrites
+# it at claim time and the pool address is recycled automatically.
+#
+# Unlike the MAC, this cannot be derived. It is needed BEFORE inspection, so
+# there is no inspection status to read and no rendered template to hook.
+#
+# CONFIRMED 2026-09-18: removing and re-adding the `vcluster-sync` tag in NetBox
+# destroys and recreates the BareMetalHost without the annotation, so the demo's
+# headline gesture (untag to release, re-tag to reclaim) strands the machine.
+# That is the case this job is really here for.
+#
+# RETIRE THIS when the platform allocates the provisioning address at BMH
+# REGISTRATION rather than at claim. It already owns the range and already
+# writes the annotation; only the timing is wrong.
+#
+#   kubectl -n metal3-system apply -f manifests/metal3/provisioning-ip-annotator-cronjob.yaml
+#
+# Pool is POOL_START/POOL_END below: 172.22.0.13-22, above the DHCP proxy VIP
+# (.2) and the BMC aliases (.3-.12), below the platform's IPAM (.23-.250). Ten
+# addresses for ten machines; widen it if the fleet grows.
+#
+# The image needs kubectl AND a shell: registry.k8s.io/kubectl is distroless and
+# fails with `stat /bin/sh: no such file or directory`.
+# ############################################################################
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: provisioning-ip-annotator
+  namespace: metal3-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: provisioning-ip-annotator
+  namespace: metal3-system
+rules:
+  - apiGroups: ["metal3.io"]
+    resources: ["baremetalhosts"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: provisioning-ip-annotator
+  namespace: metal3-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: provisioning-ip-annotator
+subjects:
+  - kind: ServiceAccount
+    name: provisioning-ip-annotator
+    namespace: metal3-system
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: provisioning-ip-annotator
+  namespace: metal3-system
+spec:
+  schedule: "*/2 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          serviceAccountName: provisioning-ip-annotator
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+          containers:
+            - name: annotate
+              image: alpine/k8s:1.31.0
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+                limits: {cpu: 200m, memory: 128Mi}
+              env:
+                - name: NS
+                  value: metal3-system
+                # kubectl caches under $HOME; runAsUser 65532 has no home dir.
+                - name: HOME
+                  value: /tmp
+                - name: PREFIX
+                  value: "172.22.0"
+                - name: MASK
+                  value: "24"
+                - name: POOL_START
+                  value: "13"
+                - name: POOL_END
+                  value: "22"
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+
+                  # "<name> <ip-or-empty>" per host. Hosts that already carry an
+                  # address are left alone, including ones the platform moved
+                  # into its own IPAM range (.23+) when the machine was claimed.
+                  LIST=$(kubectl -n "$NS" get baremetalhosts.metal3.io \
+                    -l machines.vcluster.com/source=netbox \
+                    -o go-template='{{- range .items -}}{{ .metadata.name }} {{ with .metadata.annotations }}{{ with index . "metal3.vcluster.com/ip-address" }}{{ . }}{{ end }}{{ end }}{{ "\n" }}{{- end -}}')
+                  used=$(echo "$LIST" | awk 'NF==2 { split($2,a,"/"); print a[1] }')
+
+                  # `for`, not a `while read` pipeline: a pipeline runs in a
+                  # subshell and $used would not accumulate, so two hosts in the
+                  # same run could be handed the same address.
+                  for name in $(echo "$LIST" | awk 'NF==1 { print $1 }'); do
+                    chosen=""
+                    i=$POOL_START
+                    while [ "$i" -le "$POOL_END" ]; do
+                      cand="$PREFIX.$i"
+                      if ! printf '%s\n' "$used" | grep -qx "$cand"; then
+                        chosen="$cand"
+                        break
+                      fi
+                      i=$((i + 1))
+                    done
+                    if [ -z "$chosen" ]; then
+                      echo "! $name needs an address, pool $PREFIX.$POOL_START-$POOL_END exhausted" >&2
+                      continue
+                    fi
+                    kubectl -n "$NS" annotate baremetalhosts.metal3.io "$name" \
+                      "metal3.vcluster.com/ip-address=$chosen/$MASK"
+                    echo "+ $name -> $chosen/$MASK"
+                    used=$(printf '%s\n%s' "$used" "$cand")
+                  done
+
+                  echo "done; $(echo "$LIST" | awk 'NF==1' | wc -l) host(s) needed an address"

@@ -37,10 +37,10 @@ spec:
     # it demonstrably works; change only if you are touching this line anyway.
     metal3.vcluster.com/network-cidr: 172.22.0.1/24
     metal3.vcluster.com/network-ip-range: 172.22.0.23-172.22.0.250
-    # This lab's MachineConfigTemplate. It renders networkData from a
-    # per-host `lan.vcluster.com/mac` annotation, which the import cannot set
-    # -- see manifests/metal3/lan-mac-annotator-cronjob.yaml for the workaround
-    # and why. Check whether yours has the same dependency before cutting over.
+    # This lab's optional two-NIC MachineConfigTemplate. It renders networkData
+    # from the host's inspected NICs, choosing the first non-PXE MAC for the
+    # tenant/LAN link. Keep your existing networkData instead if it already
+    # targets the right NIC; single-NIC labs often do not need this property.
     vcluster.com/network-data-template-config: vmetal-lan-only-postboot
     vcluster.com/os-image: ubuntu-noble-bootstrap
     vcluster.com/ssh-keys: admin-bastion-host
