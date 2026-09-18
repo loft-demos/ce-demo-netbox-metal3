@@ -1,8 +1,6 @@
 # What the platform reads out of NetBox
 
-**Source:** `loft-enterprise/pkg/netbox` and `pkg/controllers/netbox`, as of
-vCluster Platform 4.13.0-alpha.12. Read this when a device "looks fine in
-NetBox" but the platform disagrees.
+Read this when a device "looks fine in NetBox" but the platform disagrees.
 
 ---
 
