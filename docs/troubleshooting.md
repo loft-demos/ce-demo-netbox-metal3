@@ -134,7 +134,7 @@ appears on the next sync; nothing needs restarting.
 | `BMCAddress` | set the device's **out-of-band IP**, or assign an IP to an interface with `mgmt_only` |
 | `BMCInterface` | same: either `oob_ip` or a `mgmt_only` interface satisfies it |
 | `BootMACAddress` | add a MAC object on a non-management interface, not just the interface |
-| `Serial` | the device serial is blank; on an emulated fleet it must be the libvirt domain UUID |
+| `Serial` | the device serial is blank. On sushy-tools it must be the libvirt domain UUID; on kubevirtbmc any non-empty value works ([kubevirtbmc.md](kubevirtbmc.md#the-serial-stops-being-a-smuggling-channel)) |
 | `BMCCredentials` | one or both of the BMC login custom fields is empty |
 
 `BootMACAddress` with MACs clearly present usually means every non-management
@@ -269,6 +269,14 @@ kubectl --context "$METAL3_CONTEXT" -n "$METAL3_NS" get bmh <name> \
   can reach the BMC network; in an emulated lab that means pinned to the host
   running sushy-tools, because from any other node the provisioning subnet
   routes to the LAN and dies on a 60s connect timeout.
+- **kubevirtbmc, `redfish://<ip>:443`, TLS handshake fails**: the virtbmc TLS
+  front end only has a certificate for the Service DNS name. By IP there is no
+  SNI, and a Caddy `tls internal` sidecar aborts with
+  `tlsv1 alert internal error`, while the same request by DNS name works. Add
+  the IP as a site address with `default_sni`;
+  [kubevirtbmc.md](kubevirtbmc.md#option-b-also-needs-the-tls-terminator-to-answer-on-the-ip)
+  has the Caddyfile and the check. Only the terminator changes;
+  `bmc.address` was already right.
 
 ---
 
@@ -334,6 +342,36 @@ If it is empty, apply or check
 `metal3.vcluster.com/ip-address` when a Machine claims the host, but inspection
 happens earlier, so imported BareMetalHosts need a registration-time value until
 the platform owns that lifecycle stage.
+
+Empty for the first minute or two after a tag is normal: the host goes
+`inspecting` straight after registering, and the annotator only runs every two
+minutes. Once it stamps the address the machine's PXE retries get a lease and
+inspection carries on. On the kubevirtbmc reference run every host reached
+`available` within about two minutes of its address appearing. To skip the
+wait:
+
+```bash
+kubectl --context "$METAL3_CONTEXT" -n "$METAL3_NS" \
+  create job --from=cronjob/provisioning-ip-annotator "provisioning-ip-annotator-$(date +%s)"
+```
+
+---
+
+## Pinning a virtbmc Service's ClusterIP is refused
+
+```text
+Service "<vm>-virtbmc" is invalid: spec.clusterIPs[0]: Invalid value: ["<ip>"]: may not change once set
+```
+
+`clusterIP` is immutable on a live Service, so neither `kubectl apply` nor a
+reconciler can move an existing virtbmc Service onto the address you pinned for
+it ([kubevirtbmc.md](kubevirtbmc.md#picking-and-pinning-the-addresses)). Delete
+the Service and let whatever owns it recreate it with the pinned value. A
+GitOps reconciler with self-heal does that on its next retry.
+
+Hosts that address their BMC by DNS name are unaffected: the name follows the
+Service to its new IP. Do it before the import registers any host by IP,
+because a registered host's `bmc.address` cannot follow a changed ClusterIP.
 
 ---
 
