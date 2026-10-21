@@ -1,0 +1,24 @@
+# The one BMC login every virtbmc checks, and the Secret the NetBox import's
+# bareMetalHostTemplate pins with bmc.credentialsName.
+#
+# Same idea as manifests/metal3/shared-bmc-creds-secret.yaml, with one more
+# consumer: here the virtbmc containers read it too (virtbmc-machine.yaml), so
+# Ironic and the emulated BMC cannot disagree about the password.
+#
+# Why shared rather than per machine: kubevirtbmc deployments usually name the
+# per-machine Secret <vm-name>-bmc, which is the name the import writes and, on
+# untag, deletes, even when credentialsName is pinned. With this Secret pinned
+# the import writes no per-host Secret at all, and NetBox needs no
+# bmc_username / bmc_password custom fields.
+#
+# Any name works as long as it is not <device-name>-bmc for some device.
+# Apply in the namespace where the VMs and BareMetalHosts live.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: virtbmc-shared-creds
+  namespace: <namespace>
+type: Opaque
+stringData:
+  username: <bmc-username>
+  password: <bmc-password>

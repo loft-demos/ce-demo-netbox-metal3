@@ -1,0 +1,91 @@
+# ############################################################################
+# FRAGMENT - DO NOT `kubectl apply` THIS FILE.
+#
+# The kubevirtbmc counterpart of
+# manifests/platform/metal3-node-provider-netbox.fragment.yaml: the two blocks
+# to merge into a Metal3 NodeProvider you ALREADY HAVE. Same rules apply: keep
+# your spec.metal3.deploy block exactly as it is, and if a GitOps reconciler
+# owns the provider, merge in its repo and push.
+#
+# This is the configuration run end to end in docs/kubevirtbmc.md ("What is
+# verified"): option B addressing, one shared BMC login, virtio disks, cleaning
+# off. It assumes each machine looks like virtbmc-machine.yaml and
+# kubevirt-vm.yaml in this directory.
+# ############################################################################
+
+# ---------------------------------------------------------------------------
+# BLOCK 1 - add under spec.metal3, as a sibling of clusterRef / deploy / nodeTypes
+# ---------------------------------------------------------------------------
+netBox:
+  # The connector Secret, on the PLATFORM cluster. Its `url` is also what NetBox
+  # builds the record links in the Platform UI from, so prefer a URL a browser
+  # can open over an in-cluster Service name when the Platform can reach it.
+  secretRef:
+    namespace: vcluster-platform
+    name: netbox
+
+  tag: vcluster-sync
+
+  # Option B: the device's oob_ip is the virtbmc Service's pinned ClusterIP.
+  # kubevirtbmc serves /redfish/v1/Systems/1 for every machine and BMO accepts
+  # the address with no system path, so the template is the default minus the
+  # path, plus the TLS port. The TLS front end must answer on that IP; see
+  # docs/kubevirtbmc.md, "Option B also needs the TLS terminator to answer on
+  # the IP".
+  addressTemplate: "redfish://{{ .Address }}:443"
+
+  # No customFields: with bmc.credentialsName pinned below, the import reads no
+  # BMC login from NetBox and writes no per-host Secret.
+
+  bareMetalHostTemplate:
+    metadata:
+      labels:
+        # The one dimension NetBox has no field for: "this fleet".
+        demo: netbox-import
+    spec:
+      bmc:
+        # The Secret every virtbmc also reads (virtbmc-shared-creds.yaml).
+        # Never a <device-name>-bmc name: the import deletes that one on untag.
+        credentialsName: virtbmc-shared-creds
+        # virtbmc's TLS front end uses an internally issued certificate.
+        disableCertificateVerification: true
+      # One value for every host: the whole tagged fleet must share a disk bus.
+      # virtio -> /dev/vda; scsi/sata/usb -> /dev/sda.
+      rootDeviceHints:
+        deviceName: /dev/vda
+      # Match whatever your VM definitions expect. Existing kubevirtbmc demos,
+      # and the verified run, disable it.
+      automatedCleaningMode: disabled
+      # Deliberately NOT online: true; the claim path wants hosts powered off.
+      #
+      # Do not put metal3.vcluster.com/* annotations (ip-address, gateway,
+      # dns-servers) in the template: template annotations are re-applied every
+      # sync and would undo what the claim controller writes. The inspection
+      # address comes from manifests/metal3/provisioning-ip-annotator-cronjob.yaml.
+
+# ---------------------------------------------------------------------------
+# BLOCK 2 - rewrite spec.metal3.nodeTypes[*].bareMetalHosts.selector
+#
+# Exactly as in the sushy fragment: select on the netbox.vcluster.com/* labels
+# the import stamps from the DCIM record. Rack takes the NetBox rack NAME, so
+# keep rack names free of spaces. One pool shown; add one per rack or size.
+#
+# Any operator-owned label you already select on (a reservation marker, say)
+# can stay as a matchExpressions term: the sync only rewrites the keys it owns
+# (machines.vcluster.com/source, machines.vcluster.com/netbox-device and
+# netbox.vcluster.com/*), and leaves the rest of a host's labels alone.
+# ---------------------------------------------------------------------------
+nodeTypes:
+  - name: rack-1
+    bareMetalHosts:
+      selector:
+        matchLabels:
+          demo: netbox-import
+          machines.vcluster.com/source: netbox
+          netbox.vcluster.com/site: <site-slug>
+          netbox.vcluster.com/location: <location-slug>
+          netbox.vcluster.com/rack: <rack-name>
+          netbox.vcluster.com/role: cpu-compute
+        matchExpressions:
+          - key: vcluster.com/reserved
+            operator: DoesNotExist

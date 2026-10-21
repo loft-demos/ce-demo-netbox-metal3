@@ -1,0 +1,180 @@
+# ############################################################################
+# One emulated machine's BMC for the NetBox import, kubevirtbmc lane.
+#
+# Repeat per machine (a Helm range or a kustomize component does this well).
+# It is the shape run end to end in docs/kubevirtbmc.md ("What is verified"),
+# with the three things that lane needs and a stock kubevirtbmc chart lacks:
+#
+#   1. Service spec.clusterIP PINNED: the address NetBox records as oob_ip and
+#      the import renders into bmc.address. Allocate it from the low, static
+#      band of your Service CIDR; it cannot change once the host registers.
+#   2. The TLS sidecar answers on that IP as well as on the Service DNS name.
+#      Ironic dials redfish://<ip>:443 with no SNI; a DNS-only Caddy site aborts
+#      that handshake with `tlsv1 alert internal error`.
+#   3. The login comes from ONE shared Secret (virtbmc-shared-creds.yaml), not
+#      a per-machine `<vm-name>-bmc`: that is the name the import deletes when a
+#      device is untagged, even with bmc.credentialsName pinned.
+#
+# Placeholders:
+#   <namespace>     where the VMs live; Ironic must share this cluster
+#   <vm-name>       the KubeVirt VirtualMachine name == the NetBox device name
+#   <pinned-ip>     e.g. 10.128.0.201 in a 10.128.0.0/16 Service CIDR
+#   <serial>        what Redfish should report; see the BMC_SERIAL_NUMBER note
+#   <virtbmc-image> verified: ghcr.io/loft-sh/kubevirtbmc/virtbmc:v0.7.0-vcluster
+#
+# Check it the way Ironic will before seeding NetBox:
+#   kubectl -n <namespace> run redfish-check --rm -i --restart=Never \
+#     --image=curlimages/curl --command -- \
+#     curl -sk -u '<user>:<password>' -o /dev/null -w '%{http_code}\n' \
+#     https://<pinned-ip>:443/redfish/v1/Systems/1        # want 200
+# ############################################################################
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: <vm-name>-virtbmc
+  namespace: <namespace>
+---
+# virtbmc translates Redfish power operations into VirtualMachine start/stop.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: <vm-name>-virtbmc
+  namespace: <namespace>
+rules:
+  - apiGroups:
+      - kubevirt.io
+    resources:
+      - virtualmachines
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+  - apiGroups:
+      - subresources.kubevirt.io
+    resources:
+      - virtualmachines/start
+      - virtualmachines/stop
+      - virtualmachines/restart
+    verbs:
+      - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: <vm-name>-virtbmc
+  namespace: <namespace>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: <vm-name>-virtbmc
+subjects:
+  - kind: ServiceAccount
+    name: <vm-name>-virtbmc
+    namespace: <namespace>
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: <vm-name>-virtbmc
+  namespace: <namespace>
+  labels:
+    kubevirt.io/virtualmachinebmc-name: <vm-name>
+    kubevirt.io/vm-name: <vm-name>
+spec:
+  serviceName: <vm-name>-virtbmc
+  replicas: 1
+  selector:
+    matchLabels:
+      kubevirt.io/virtualmachinebmc-name: <vm-name>
+  template:
+    metadata:
+      labels:
+        kubevirt.io/virtualmachinebmc-name: <vm-name>
+        kubevirt.io/vm-name: <vm-name>
+    spec:
+      serviceAccountName: <vm-name>-virtbmc
+      containers:
+        - name: virtbmc
+          image: <virtbmc-image>
+          args:
+            - --address
+            - 0.0.0.0
+            - --ipmi-port
+            - "10623"
+            - --redfish-port
+            - "10080"
+            - <namespace>
+            - <vm-name>
+          env:
+            # The shared login. Do NOT name a Secret <vm-name>-bmc for a machine
+            # the import owns (docs/kubevirtbmc.md, "The credentials Secret name
+            # collides").
+            - name: BMC_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: virtbmc-shared-creds
+                  key: username
+            - name: BMC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: virtbmc-shared-creds
+                  key: password
+            # Some virtbmc builds read this as the Redfish SerialNumber; the
+            # verified v0.7.0-vcluster build ignores it and reports
+            # 000000000000. The import only needs a non-empty NetBox serial, so
+            # set the same value there either way.
+            - name: BMC_SERIAL_NUMBER
+              value: "<serial>"
+          ports:
+            - containerPort: 10623
+              name: ipmi
+              protocol: UDP
+            - containerPort: 10080
+              name: redfish
+        # TLS in front of virtbmc's plaintext Redfish port. Both site addresses
+        # matter: the DNS name for anything already registered by name, the IP
+        # (plus default_sni, because an IP client sends no SNI) for the import.
+        - name: caddy
+          image: caddy:2
+          command:
+            - sh
+            - -c
+            - |
+              cat <<EOF > /tmp/Caddyfile
+              {
+                  default_sni <pinned-ip>
+              }
+              <vm-name>-virtbmc.<namespace>.svc.cluster.local:443, <pinned-ip>:443 {
+                  tls internal
+                  reverse_proxy localhost:10080
+              }
+              EOF
+              caddy run --config /tmp/Caddyfile
+          ports:
+            - containerPort: 443
+              name: https
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: <vm-name>-virtbmc
+  namespace: <namespace>
+  labels:
+    kubevirt.io/virtualmachinebmc-name: <vm-name>
+    kubevirt.io/vm-name: <vm-name>
+spec:
+  # Pinned, recorded in NetBox as the device's oob_ip. Immutable on a live
+  # Service: moving an existing one here means delete and recreate
+  # (docs/troubleshooting.md, "Pinning a virtbmc Service's ClusterIP is refused").
+  clusterIP: <pinned-ip>
+  selector:
+    kubevirt.io/virtualmachinebmc-name: <vm-name>
+  ports:
+    - name: ipmi
+      port: 623
+      protocol: UDP
+      targetPort: ipmi
+    - name: https
+      port: 443
+      targetPort: https
