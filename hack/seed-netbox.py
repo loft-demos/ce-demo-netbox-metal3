@@ -34,6 +34,10 @@ be read-only; this script is the only thing here that writes to NetBox.
 Add --with-modules to also record CPU/GPU modules, which is what fills in
 Machine.status.hardware on the platform side.
 
+--paper N adds demo-only devices with no machine behind them (see PAPER_RACKS);
+with --paper-only it needs no inventory and works for any lane, kubevirtbmc
+included.
+
 NO DEVICE GETS A GPU unless you name it with --gpu-device. That is deliberate:
 an emulated fleet has as many GPUs as the host physically owns, usually one or
 none, and seeding a whole size class as gpu-compute puts machines in a pool
@@ -41,6 +45,7 @@ that cannot run the workload.
 """
 
 import argparse
+import hashlib
 import json
 import re
 import os
@@ -195,7 +200,15 @@ class NetBox:
 
     def ensure(self, path, lookup, payload, label):
         """Create the object or patch the fields that drifted."""
-        existing = self.find(path, lookup)
+        # In a dry run, a parent that "would be created" carries a placeholder
+        # id rather than a real one. Nothing can exist under it yet, and asking
+        # NetBox to filter by it is a 400 ("<new site dc1>" is not a valid
+        # value), so treat it as not found instead of querying.
+        pending_parent = any(
+            isinstance(value, str) and value.startswith("<new ")
+            for value in lookup.values()
+        )
+        existing = None if pending_parent else self.find(path, lookup)
         if existing is None:
             if self.dry_run:
                 print(f"  + would create {label}")
@@ -287,6 +300,286 @@ def ip_add(start, offset):
     return ".".join(str(o) for o in octets)
 
 
+# ---- paper fleet -----------------------------------------------------------
+# Demo inventory with no machine behind it, for showing what a NetBox import
+# looks like against a full hall rather than a handful of emulated boxes: the
+# DCIM holds a hundred servers, the platform takes only what is tagged.
+#
+# Paper devices are built so they can never reach Ironic:
+#   - they carry PAPER_TAG and never the sync tag, so nothing imports them;
+#   - they have a mgmt_only bmc0 but NO IP on it and no oob_ip, so a sync tag
+#     added by hand stops at MissingRequirements (BMCAddress) with no
+#     BareMetalHost, which is itself a decent demo of the gate;
+#   - they sit in their own location and racks, so no NodeType selector written
+#     for the real fleet matches them even if tagged.
+#
+# Rack, model, slug, rack units, role, (CPU model, count), (GPU model, count).
+PAPER_TAG = "demo-paper"
+PAPER_RACKS = [
+    ("rack-p01", "Dell", "PowerEdge XE9680", "dell-xe9680", 6, GPU_ROLE, ("Xeon Platinum 8480+", 2), ("H100 SXM5 80GB", 8)),
+    ("rack-p02", "Dell", "PowerEdge XE9680", "dell-xe9680", 6, GPU_ROLE, ("Xeon Platinum 8480+", 2), ("H100 SXM5 80GB", 8)),
+    ("rack-p03", "Supermicro", "SYS-821GE-TNHR", "smc-821ge-tnhr", 8, GPU_ROLE, ("Xeon Platinum 8468", 2), ("H100 SXM5 80GB", 8)),
+    ("rack-p04", "Supermicro", "SYS-821GE-TNHR", "smc-821ge-tnhr", 8, GPU_ROLE, ("Xeon Platinum 8468", 2), ("H100 SXM5 80GB", 8)),
+    ("rack-p05", "Dell", "PowerEdge R760xa", "dell-r760xa", 2, GPU_ROLE, ("Xeon Gold 6448Y", 2), ("L40S 48GB", 4)),
+    ("rack-p06", "Dell", "PowerEdge R760xa", "dell-r760xa", 2, GPU_ROLE, ("Xeon Gold 6448Y", 2), ("L40S 48GB", 4)),
+    ("rack-p07", "Dell", "PowerEdge R660", "dell-r660", 1, CPU_ROLE, ("Xeon Gold 6430", 2), None),
+    ("rack-p08", "Dell", "PowerEdge R660", "dell-r660", 1, CPU_ROLE, ("Xeon Gold 6430", 2), None),
+]
+PAPER_RACK_U = 42
+# The top of a real rack is switches, PDUs and patch panels, not servers.
+PAPER_RACK_RESERVED_U = 10
+# Locally administered, and disjoint from anything a libvirt or KubeVirt lab
+# hands out, so a paper MAC can never shadow a real boot MAC.
+PAPER_MAC_PREFIX = "02:00:00:01"
+
+
+def paper_layout(count):
+    """Spread `count` devices round-robin across PAPER_RACKS, bottom-up.
+
+    Deterministic: the same count always yields the same names, positions,
+    serials, MACs and statuses, so re-running converges like the rest of the
+    seed instead of reshuffling the hall.
+    """
+    capacity = [
+        (PAPER_RACK_U - PAPER_RACK_RESERVED_U) // rack[4] for rack in PAPER_RACKS
+    ]
+    if count > sum(capacity):
+        raise SystemExit(
+            f"--paper {count}: the {len(PAPER_RACKS)} paper racks hold at most "
+            f"{sum(capacity)} devices"
+        )
+    placed = [0] * len(PAPER_RACKS)
+    layout = []
+    while len(layout) < count:
+        for r, rack in enumerate(PAPER_RACKS):
+            if placed[r] < capacity[r] and len(layout) < count:
+                layout.append({"spec": rack, "slot": placed[r]})
+                placed[r] += 1
+    layout.sort(key=lambda d: (d["spec"][0], d["slot"]))
+    for index, device in enumerate(layout, start=1):
+        rack, manufacturer, _, slug, u_height, _, _, _ = device["spec"]
+        position = 1 + device["slot"] * u_height
+        short = slug.split("-", 1)[1]
+        device["name"] = f"{rack}-u{position:02d}-{short}"
+        device["position"] = position
+        digest = hashlib.sha1(device["name"].encode()).hexdigest().upper()
+        # Dell service tags are seven characters; Supermicro serials are not.
+        device["serial"] = (
+            digest[:7] if manufacturer == "Dell" else "S" + str(int(digest[:10], 16))[:10]
+        )
+        device["mac"] = f"{PAPER_MAC_PREFIX}:{index // 256:02X}:{index % 256:02X}"
+        # A believable hall: mostly active, the last rack partly still planned,
+        # a few boxes failed or offline.
+        if rack == PAPER_RACKS[-1][0] and device["slot"] >= placed[-1] - 9:
+            device["status"] = "planned"
+        elif index % 23 == 7:
+            device["status"] = "failed"
+        elif index % 29 == 11:
+            device["status"] = "offline"
+        else:
+            device["status"] = "active"
+    return layout
+
+
+def seed_paper(nb, args, site):
+    """Create or converge the paper devices. Never touches the real fleet."""
+    layout = paper_layout(args.paper)
+    print(
+        f"\n[paper] {len(layout)} demo devices in location {args.paper_location} "
+        f"(tag {PAPER_TAG}, never {args.tag}, no BMC IP)"
+    )
+    tag = nb.ensure(
+        "/api/extras/tags/",
+        {"slug": PAPER_TAG},
+        {
+            "name": PAPER_TAG,
+            "slug": PAPER_TAG,
+            "color": "9e9e9e",
+            "description": "Demo inventory with no machine behind it; never imported",
+        },
+        f"tag {PAPER_TAG}",
+    )
+    location = nb.ensure(
+        "/api/dcim/locations/",
+        {"slug": args.paper_location, "site_id": site["id"]},
+        {
+            "name": args.paper_location,
+            "slug": args.paper_location,
+            "site": site["id"],
+            "status": "active",
+        },
+        f"location {args.paper_location}",
+    )
+    manufacturers, module_types, device_types, roles, racks = {}, {}, {}, {}, {}
+
+    def manufacturer(name):
+        if name not in manufacturers:
+            slug = name.lower().replace(" ", "-")
+            manufacturers[name] = nb.ensure(
+                "/api/dcim/manufacturers/",
+                {"slug": slug},
+                {"name": name, "slug": slug},
+                f"manufacturer {name}",
+            )
+        return manufacturers[name]
+
+    def module_type(maker, model):
+        if model not in module_types:
+            module_types[model] = nb.ensure(
+                "/api/dcim/module-types/",
+                {"model": model},
+                {"manufacturer": manufacturer(maker)["id"], "model": model},
+                f"module type {model}",
+            )
+        return module_types[model]
+
+    for slug in (GPU_ROLE, CPU_ROLE):
+        name, color = ROLES[slug]
+        roles[slug] = nb.ensure(
+            "/api/dcim/device-roles/",
+            {"slug": slug},
+            {"name": name, "slug": slug, "color": color},
+            f"device role {slug}",
+        )
+    for rack, maker, model, slug, u_height, _, _, _ in PAPER_RACKS:
+        racks[rack] = nb.ensure(
+            "/api/dcim/racks/",
+            {"name": rack, "site_id": site["id"]},
+            {
+                "name": rack,
+                "site": site["id"],
+                "location": location["id"],
+                "status": "active",
+                "u_height": PAPER_RACK_U,
+            },
+            f"rack {rack}",
+        )
+        if slug not in device_types:
+            device_types[slug] = nb.ensure(
+                "/api/dcim/device-types/",
+                {"slug": slug},
+                {
+                    "manufacturer": manufacturer(maker)["id"],
+                    "model": model,
+                    "slug": slug,
+                    "u_height": u_height,
+                },
+                f"device type {slug}",
+            )
+
+    for device in layout:
+        rack, _, model, slug, _, role, cpu, gpu = device["spec"]
+        print(f"\n  {device['name']}  ({model}, {rack} U{device['position']}, {device['status']})")
+        record = nb.ensure(
+            "/api/dcim/devices/",
+            {"name": device["name"]},
+            {
+                "name": device["name"],
+                "role": roles[role]["id"],
+                "device_type": device_types[slug]["id"],
+                "site": site["id"],
+                "location": location["id"],
+                "rack": racks[rack]["id"],
+                "position": device["position"],
+                "face": "front",
+                "status": device["status"],
+                "serial": device["serial"],
+                "description": "Demo inventory: no machine behind this record",
+                "tags": [tag["id"]],
+            },
+            f"device {device['name']}",
+        )
+        if not isinstance(record.get("id"), int):
+            continue
+
+        interfaces = {}
+        for iface_name, mgmt_only, description in (
+            ("bmc0", True, "BMC (no address allocated)"),
+            ("eth0", False, "Provisioning / PXE"),
+        ):
+            interfaces[iface_name] = nb.ensure(
+                "/api/dcim/interfaces/",
+                {"device_id": record["id"], "name": iface_name},
+                {
+                    "device": record["id"],
+                    "name": iface_name,
+                    "type": "1000base-t",
+                    "enabled": True,
+                    "mgmt_only": mgmt_only,
+                    "description": description,
+                },
+                f"interface {iface_name}",
+            )
+        mac_object = nb.ensure(
+            "/api/dcim/mac-addresses/",
+            {"mac_address": device["mac"]},
+            {
+                "mac_address": device["mac"],
+                "assigned_object_type": "dcim.interface",
+                "assigned_object_id": interfaces["eth0"]["id"],
+            },
+            f"mac {device['mac']} on eth0",
+        )
+        if isinstance(mac_object.get("id"), int):
+            nb.ensure(
+                "/api/dcim/interfaces/",
+                {"device_id": record["id"], "name": "eth0"},
+                {"primary_mac_address": mac_object["id"]},
+                "primary mac on eth0",
+            )
+
+        # Bay names decide the hardware kind on the platform side (cpu*, gpu*),
+        # should anyone tag one of these and look at Machine.status.hardware.
+        bays = [(f"CPU{i + 1}", "Intel", cpu[0]) for i in range(cpu[1])]
+        if gpu:
+            bays += [(f"GPU{i + 1}", "NVIDIA", gpu[0]) for i in range(gpu[1])]
+        for bay_name, module_maker, module_model in bays:
+            mt = module_type(module_maker, module_model)
+            bay = nb.ensure(
+                "/api/dcim/module-bays/",
+                {"device_id": record["id"], "name": bay_name},
+                {"device": record["id"], "name": bay_name},
+                f"module bay {bay_name}",
+            )
+            if isinstance(bay.get("id"), int) and isinstance(mt.get("id"), int):
+                nb.ensure(
+                    "/api/dcim/modules/",
+                    {"device_id": record["id"], "module_bay_id": bay["id"]},
+                    {
+                        "device": record["id"],
+                        "module_bay": bay["id"],
+                        "module_type": mt["id"],
+                        "status": "active",
+                    },
+                    f"module {module_model} in {bay_name}",
+                )
+
+
+def delete_paper(nb):
+    """Delete every device carrying PAPER_TAG, then the MACs it leaves behind.
+
+    NetBox cascades a device delete to its interfaces, module bays and modules.
+    MAC objects survive it unassigned, so they are cleaned up by prefix. Racks,
+    device types and the location are left in place; they cost nothing and a
+    later --paper run reuses them.
+    """
+    page = nb.request("GET", "/api/dcim/devices/", params={"tag": PAPER_TAG, "limit": 1000, "brief": 1})
+    devices = page.get("results", []) if page else []
+    print(f"[paper] deleting {len(devices)} device(s) tagged {PAPER_TAG}" + (" (dry run)" if nb.dry_run else ""))
+    if nb.dry_run:
+        return
+    for device in devices:
+        nb.request("DELETE", f"/api/dcim/devices/{device['id']}/")
+    macs = nb.request(
+        "GET",
+        "/api/dcim/mac-addresses/",
+        params={"mac_address__isw": PAPER_MAC_PREFIX + ":", "limit": 1000},
+    )
+    for mac in (macs or {}).get("results", []):
+        if mac.get("assigned_object") is None:
+            nb.request("DELETE", f"/api/dcim/mac-addresses/{mac['id']}/")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     env = os.environ.get
@@ -350,11 +643,53 @@ def main():
     )
     parser.add_argument("--gpu-manufacturer", default=GPU_MANUFACTURER)
     parser.add_argument("--gpu-model", default=GPU_MODEL)
+    parser.add_argument(
+        "--paper",
+        type=int,
+        default=0,
+        metavar="N",
+        help="also seed N demo-only devices with no machine behind them (up to "
+        "114, across PAPER_RACKS). Tagged demo-paper, never the sync tag, and "
+        "with no BMC IP, so the platform never imports one",
+    )
+    parser.add_argument(
+        "--paper-location",
+        default=env("NETBOX_PAPER_LOCATION", "row-2"),
+        help="location slug for the paper racks (default row-2), kept apart "
+        "from the real fleet's location so no pool selector matches them",
+    )
+    parser.add_argument(
+        "--paper-only",
+        action="store_true",
+        help="seed only the paper devices: no inventory is read and the real "
+        "fleet is left exactly as it is. The site must already exist",
+    )
+    parser.add_argument(
+        "--paper-delete",
+        action="store_true",
+        help="delete every device tagged demo-paper, then exit",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     if not args.url or not args.token:
         raise SystemExit("set --url/--token or NETBOX_URL/NETBOX_TOKEN")
+
+    if args.paper_delete or args.paper_only:
+        nb = NetBox(args.url, args.token, dry_run=args.dry_run, insecure=args.insecure)
+        if args.paper_delete:
+            delete_paper(nb)
+            return 0
+        if args.paper < 1:
+            raise SystemExit("--paper-only needs --paper N")
+        site = nb.find("/api/dcim/sites/", {"slug": args.site})
+        if site is None:
+            raise SystemExit(
+                f"site {args.site} does not exist yet: seed the real fleet "
+                "first, or create the site in NetBox"
+            )
+        seed_paper(nb, args, site)
+        return 0
 
     machines = parse_inventory(args.inventory)
     gpu_device = args.gpu_device.strip()
@@ -664,6 +999,9 @@ def main():
         "  sudo -E bash hack/bmc-ip-aliases.sh apply\n"
         "  curl -s http://%s:8000/redfish/v1/Systems | head\n" % bmc_ips[0][1]
     )
+
+    if args.paper:
+        seed_paper(nb, args, site)
 
 
 if __name__ == "__main__":
