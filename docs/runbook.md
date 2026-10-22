@@ -406,6 +406,18 @@ provisioning NIC wins. Rename them at your peril.
 Spot-check one device in the UI. It should show a rack elevation position, an
 out-of-band IP, a serial that matches the real machine, and the tag.
 
+**Want a fuller hall to show?** `--paper N` adds up to 114 demo-only devices
+(GPU and CPU servers with modules, a mix of statuses) in their own location
+and racks. They carry a `demo-paper` tag, never the sync tag, and no BMC IP, so
+the platform never imports one; tag one by hand and it stops at
+`MissingRequirements` with no BareMetalHost. `--paper-only` seeds them without
+touching the real fleet (works on either lane), `--paper-delete` removes them.
+
+```bash
+python3 hack/seed-netbox.py --paper 96 --paper-only --dry-run
+python3 hack/seed-netbox.py --paper 96 --paper-only
+```
+
 ---
 
 ## 6. Decide what happens to existing BareMetalHosts

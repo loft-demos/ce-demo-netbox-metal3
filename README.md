@@ -61,10 +61,14 @@ Two lanes run through the docs, marked where they differ:
 | `addressTemplate` | vendor-specific, often the platform default works | must render the Redfish system id (see below) |
 | Everything else | identical | identical |
 
-Emulating with **kubevirtbmc** instead of sushy-tools works too, and drops two
+Emulating with **kubevirtbmc** instead of sushy-tools works too, and has been
+run end to end, through a tenant cluster claiming an imported host. It drops two
 of the three traps below. It has one of its own, because a virtbmc Service is
-addressed by DNS name and the import requires an IP. See
-[docs/kubevirtbmc.md](docs/kubevirtbmc.md) before you seed anything.
+addressed by DNS name and the import requires an IP. Two more come from how
+virtbmc is usually deployed: a TLS front end that only answers by name, and a
+per-machine `<vm>-bmc` Secret. See [docs/kubevirtbmc.md](docs/kubevirtbmc.md)
+before you seed anything; [manifests/kubevirtbmc/](manifests/kubevirtbmc/) has
+a machine and a provider fragment that avoid all three.
 
 The platform side is the same either way, and so is everything in
 [docs/netbox-data-model.md](docs/netbox-data-model.md) and
@@ -142,9 +146,15 @@ manifests/
   platform/metal3-node-provider-netbox.example.yaml
                                                 a complete worked NodeProvider, for diffing
   metal3/shared-bmc-creds-secret.yaml           optional: no BMC passwords in NetBox
+  kubevirtbmc/virtbmc-machine.yaml              kubevirtbmc lane: one machine's BMC (pinned IP, TLS on the IP)
+  kubevirtbmc/kubevirt-vm.yaml                  kubevirtbmc lane: the VM fields the import depends on
+  kubevirtbmc/virtbmc-shared-creds.yaml         kubevirtbmc lane: the one login virtbmc and Ironic share
+  kubevirtbmc/metal3-node-provider-netbox.kubevirtbmc.fragment.yaml
+                                                kubevirtbmc lane: the provider blocks to merge
   metal3/provisioning-ip-annotator-cronjob.yaml optional: patch imported BMHs with an inspection DHCP address
 hack/
-  seed-netbox.py            build a NetBox record from a libvirt inventory (idempotent)
+  seed-netbox.py            build a NetBox record from a libvirt inventory (idempotent);
+                            --paper N adds demo-only devices that are never imported
   bmc-ip-aliases.sh         give each emulated BMC its own address on the provisioning bridge
   verify-netbox-import.sh   what actually landed, both clusters
 ```

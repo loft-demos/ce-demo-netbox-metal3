@@ -1,0 +1,75 @@
+# ############################################################################
+# The parts of a KubeVirt VirtualMachine the NetBox import depends on.
+#
+# Not a complete VM for your environment: the network attachment, sizing and
+# placement are yours. What matters to the import is below, and every line of it
+# is something Metal3 will hold you to after the first registration:
+#
+#   - macAddress PINNED. NetBox records it as the device's boot MAC and the
+#     import renders it into spec.bootMACAddress, the one field Metal3 never
+#     accepts a change to. A VM that gets a fresh MAC on recreate needs a
+#     delete-and-reimport.
+#   - disk bus UNIFORM across the tagged fleet. The provider's host template
+#     sets one rootDeviceHints value for every host: virtio -> /dev/vda,
+#     scsi/sata/usb -> /dev/sda.
+#   - runStrategy Halted. virtbmc owns power from here on; the import creates
+#     hosts with online: false, which is what the claim path wants.
+#
+# NetBox: device name == <vm-name>, interface eth0 carries <boot-mac> as a MAC
+# object, bmc0 (mgmt_only) carries the virtbmc pinned IP as oob_ip.
+# ############################################################################
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: <vm-name>
+  namespace: <namespace>
+spec:
+  # If a GitOps reconciler applies this, have it ignore /spec/runStrategy, or
+  # every sync powers the machine off under Ironic.
+  runStrategy: Halted
+  dataVolumeTemplates:
+    - metadata:
+        name: <vm-name>-disk
+      spec:
+        pvc:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 40Gi
+        source:
+          blank: {}
+  template:
+    spec:
+      domain:
+        cpu:
+          cores: 2
+        devices:
+          disks:
+            # Disk first: a blank disk falls through to PXE for inspection and
+            # provisioning, and a provisioned disk boots its OS whatever the PXE
+            # layer serves.
+            - name: rootdisk
+              bootOrder: 1
+              disk:
+                bus: virtio
+          interfaces:
+            - name: provisioning
+              macAddress: "<boot-mac>"
+              bridge: {}
+              bootOrder: 2
+        resources:
+          requests:
+            memory: 4Gi
+        firmware:
+          bootloader:
+            efi:
+              secureBoot: false
+      networks:
+        - name: provisioning
+          multus:
+            networkName: <provisioning-network-attachment>
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: <vm-name>-disk
